@@ -34,7 +34,9 @@ final class Prefill {
     static let denseTiles = Engine.envMacros("EMBLA_PREFILL")["DENSE_TILES"] ?? 1
 
     unowned let engine: Engine
-    let state, x, inp, qkv, o, hmlp, hex, hsh, yex, ysh, e, ekv, gated: MTLBuffer
+    let state, x, inp, qkv, o, hmlp, hex, hsh, yex, ysh, e, ekv, gated, keep: MTLBuffer
+    /// Mixes a token in `inp` (OS in the kernels: 3, Embla 1.1's 5).
+    let os: Int
     let logits, experts, gates, entryTok, slotEntry, tiles, ntiles, counter: MTLBuffer
     var part: MTLBuffer
     /// The neural accelerator attention (attn_nax.metal) for the full layer, its normed queries and
@@ -62,6 +64,8 @@ final class Prefill {
     let pEmbed, pGate, pConv, pKVSliding, pSliding, pKV, pFull, pRouter, pRoute, pGroup, pCombine: MTLComputePipelineState
     /// Per layer: the attention and MLP input mixes (one threadgroup a token).
     var attnMix: [MTLComputePipelineState] = [], mlpMix: [MTLComputePipelineState] = []
+    /// The loop's second pass's (Engine.twins).
+    var attnMix2: [MTLComputePipelineState] = [], mlpMix2: [MTLComputePipelineState] = []
     let engramMix: MTLComputePipelineState
     /// Per MoE layer: byte offsets of the down projections in their published layout.
     var down: [Int: (routed: (UInt64, UInt64, UInt64), shared: (UInt64, UInt64, UInt64))] = [:]
@@ -71,14 +75,17 @@ final class Prefill {
         let ctx = engine.ctx, T = Self.chunk, d = Embla.d
         sliding8 = (Engine.envMacros("EMBLA_PREFILL")["SLIDING8"] ?? 1) != 0
         func buf(_ bytes: Int) -> MTLBuffer { ctx.device.makeBuffer(length: bytes, options: .storageModePrivate)! }
-        state = buf(T * 9 * d * 2)
+        let arch = engine.arch, mixes = arch.outMixes
+        os = mixes
+        state = buf(T * arch.slots * d * 2)
         x = buf(T * d * 4)
-        inp = buf(T * 3 * d * 2)
+        inp = buf(T * mixes * d * 2)
+        keep = buf(arch.loop == nil ? 16 : T * 3 * d * 4)   // the loop's fp32 block sums, [T][3][D]
         qkv = buf(T * 4096 * 2)
         o = buf(T * d * 2)
         hmlp = buf(T * d * 2)
         hex = buf(T * 8 * 512 * 2)
-        hsh = buf(T * 1024 * 2)
+        hsh = buf(T * arch.shared.max()! * 2)
         yex = buf(T * 8 * d * 2)
         ysh = buf(T * d * 2)
         e = ctx.device.makeBuffer(length: 2 * T * d * 2, options: .storageModeShared)!   // two chunks' rows
@@ -127,7 +134,8 @@ final class Prefill {
             sx = buf(rows * 32 * 4)
             xz = buf(rows * 32 * 4)
         }
-        let pf = "#define TILE_ENTRIES \(bm)\n" + (try Engine.kernelSource("prefill"))
+        let pf = "#define TILE_ENTRIES \(bm)\n" + (arch.slots != 9 ? "#define SLOTS \(arch.slots)\n" : "")
+            + (mixes != 3 ? "#define OS \(mixes)\n" : "") + (try Engine.kernelSource("prefill"))
         pEmbed = try ctx.pipeline("embed_b", source: pf)
         pGate = try ctx.pipeline("engram_gate_b", source: pf)
         pConv = try ctx.pipeline("engram_conv_b", source: pf)
@@ -149,14 +157,24 @@ final class Prefill {
         if ProcessInfo.processInfo.environment["EMBLA_VERBOSE"] != nil {
             print("prefill: GEMM on \(nax ? "neural accelerators" : "simdgroup matrices"), full attention \(pAttnNax != nil ? "on neural accelerators" : "a key at a time")")
         }
-        func mixPipe(n: Int, k: Int, hasX: Bool, norm: Bool, append: Bool) throws -> MTLComputePipelineState {
-            try ctx.pipeline("mix", source: mix, macros: ["N": n, "K": k, "HAS_X": hasX ? 1 : 0, "NORM": norm ? 1 : 0, "APPEND": append ? 1 : 0])
+        _ = mix
+        func mixPipe(n: Int, k: Int, hasX: Bool, norm: Bool, append: Bool, offs: Bool = false, keep: Int = 0, star: Bool = false) throws -> MTLComputePipelineState {
+            var m = ["N": n, "K": k, "HAS_X": hasX ? 1 : 0, "NORM": norm ? 1 : 0, "APPEND": append ? 1 : 0]
+            if arch.slots != 9 { m["SLOTS"] = arch.slots }
+            if mixes != 3 { m["OS"] = mixes }
+            if offs { m["OFFS"] = 1 }
+            if keep > 0 { m["KEEP"] = keep }
+            if star { m["STAR"] = 1 }
+            return try engine.mixPipeline(ctx, m)
         }
+        let lo = arch.loop?.lowerBound ?? Embla.layers, hi = arch.loop?.upperBound ?? Embla.layers
         for L in engine.layers where L.i <= Embla.prefillLayers {
-            let i = L.i, n = i == 0 ? 1 : 2 + i / Embla.blockSize, blockStart = i % Embla.blockSize == 0
-            attnMix.append(try mixPipe(n: n, k: L.attnK, hasX: !blockStart, norm: true, append: blockStart && i > 0))
-            mlpMix.append(try mixPipe(n: n, k: 1, hasX: true, norm: true, append: false))
-            if i > 0 {
+            let i = L.i, n = arch.sources(i), blockStart = i % Embla.blockSize == 0
+            // as Engine.buildPlans' preps: a looped block's x kept (pass 1), b* at the loop's end
+            attnMix.append(try mixPipe(n: n, k: L.attnK, hasX: !blockStart, norm: true, append: blockStart && i > 0 && i != hi,
+                                       offs: i >= hi, keep: blockStart && i > lo && i < hi ? 1 : 0, star: i == hi))
+            mlpMix.append(try mixPipe(n: n, k: arch.routerK(i), hasX: true, norm: true, append: false, offs: i >= hi))
+            if L.moe != nil {
                 func off(_ name: String) throws -> (UInt64, UInt64, UInt64) {
                     let p = "transformer.h.\(i).mlp.\(name)."
                     return (UInt64(try engine.weights.tensor(p + "weight").offset), UInt64(try engine.weights.tensor(p + "scales").offset),
@@ -164,6 +182,12 @@ final class Prefill {
                 }
                 down[i] = (try off("experts_proj"), try off("shared_proj"))
             }
+        }
+        for T in engine.twins {
+            // the loop's second pass: every source so far, its own completed block appended at 12
+            let i = T.i, n = 2 + hi / Embla.blockSize + (i - lo) / Embla.blockSize, blockStart = i % Embla.blockSize == 0
+            attnMix2.append(try mixPipe(n: n, k: 1, hasX: !blockStart, norm: true, append: blockStart, keep: blockStart ? (i == lo ? 2 : 3) : 0))
+            mlpMix2.append(try mixPipe(n: n, k: arch.routerK(i), hasX: true, norm: true, append: false))
         }
         engramMix = try mixPipe(n: 1, k: 1, hasX: true, norm: false, append: false)
     }
@@ -237,7 +261,7 @@ final class Prefill {
         for (i, s) in segs.enumerated() {
             defer { start = s.end }
             if skipFirst && i == 0 { continue }
-            gemm(enc, .plain, epi: 0, w: (s.w, s.s, s.b), x: inp, xOffset: Int(s.x) * 2, ldx: 3 * Embla.d,
+            gemm(enc, .plain, epi: 0, w: (s.w, s.s, s.b), x: inp, xOffset: Int(s.x) * 2, ldx: os * Embla.d,
                  y: qkv, yOffset: Int(s.y) * 2, ldy: 4096, tokens: tokens, rows: Int(s.end - start))
         }
     }
@@ -250,6 +274,11 @@ final class Prefill {
         enc.setBuffer(inp, offset: 0, index: 3)
         var c = col
         enc.setBytes(&c, length: 4, index: 4)
+        if engine.arch.loop != nil {
+            enc.setBuffer(engine.offs, offset: 0, index: 5)
+            enc.setBuffer(keep, offset: 0, index: 6)
+            enc.setBuffer(engine.alpha, offset: 0, index: 7)
+        }
         dispatch(enc, "mix", MTLSize(width: tokens, height: 1, depth: 1), MTLSize(width: 1024, height: 1, depth: 1))
     }
 
@@ -279,10 +308,13 @@ final class Prefill {
         dispatch(enc, "embed", MTLSize(width: 1, height: T, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
         barrier(enc)
 
-        for L in E.layers where L.i <= Embla.prefillLayers {
+        /// A layer of the prefill half (`pass2`: the loop's second pass, Engine.twins); false: the chunk ended
+        /// at layer 16's K/V (its command buffer ended).
+        func layer(_ L: Engine.Layer, pass2: Bool) -> Bool {
             let i = L.i
+            let am = pass2 ? attnMix2[i - E.arch.loop!.lowerBound] : attnMix[i], mm = pass2 ? mlpMix2[i - E.arch.loop!.lowerBound] : mlpMix[i]
             // ---- attention
-            mix(enc, attnMix[i], col: L.attnCol, tokens: T)
+            mix(enc, am, col: L.attnCol, tokens: T)
             barrier(enc)
             let last = i == Embla.prefillLayers
             segmentGEMM(enc, L.qkv, tokens: T, skipFirst: last)   // layer 16: its K/V only
@@ -320,7 +352,7 @@ final class Prefill {
                 enc.setBytes(&pm, length: 8, index: 3)
                 dispatch(enc, "attn", MTLSize(width: 2 * L.kvJobs.count, height: T, depth: 1), MTLSize(width: 32, height: 1, depth: 1))
                 barrier(enc)
-                if last { enc.endEncoding(); E.endChained(cb); return cb }
+                if last { enc.endEncoding(); E.endChained(cb); return false }
                 if let nax = pAttnNax {
                     encodeFullNAX(enc, L, nax, p0: p0, tokens: T)
                     break
@@ -340,21 +372,29 @@ final class Prefill {
                 dispatch(enc, "attn", MTLSize(width: c, height: 2, depth: T), MTLSize(width: 256, height: 1, depth: 1))
             }
             barrier(enc)
-            let os = L.oproj[0]
-            gemm(enc, .plain, epi: L.oFirst ? 3 : 2, w: (os.w, os.s, os.b), x: o, ldx: d, y: x, ldy: d, tokens: T, rows: d)
+            let op = L.oproj[0]
+            gemm(enc, .plain, epi: L.oFirst ? 3 : 2, w: (op.w, op.s, op.b), x: o, ldx: d, y: x, ldy: d, tokens: T, rows: d)
             barrier(enc)
 
             // ---- MLP
-            mix(enc, mlpMix[i], col: L.mlpCol, tokens: T)
+            mix(enc, mm, col: L.mlpCol, tokens: T)
             barrier(enc)
             if let (fc, proj) = L.dense {
-                gemm(enc, .plain, epi: 1, w: (fc[0].w, fc[0].s, fc[0].b), x: inp, ldx: 3 * d, y: hmlp, ldy: d, tokens: T, rows: d)
+                gemm(enc, .plain, epi: 1, w: (fc[0].w, fc[0].s, fc[0].b), x: inp, ldx: os * d, y: hmlp, ldy: d, tokens: T, rows: d)
                 barrier(enc)
                 gemm(enc, .plain, epi: 2, w: (proj[0].w, proj[0].s, proj[0].b), x: hmlp, ldx: d, y: x, ldy: d, tokens: T, rows: d)
                 barrier(enc)
             } else {
                 encodeMoE(enc, L, tokens: T)
             }
+            return true
+        }
+        for L in E.layers where L.i <= Embla.prefillLayers {
+            let i = L.i
+            if i == E.arch.loop?.upperBound {
+                for tw in E.twins { _ = layer(tw, pass2: true) }   // the loop's second pass, before b* (layer 16's mix)
+            }
+            if !layer(L, pass2: false) { return cb }
             if i == 0 {
                 if let (event, value) = wait {
                     enc.endEncoding()
@@ -410,11 +450,12 @@ final class Prefill {
         let E = engine, d = Embla.d, mw = L.moe!
         enc.setComputePipelineState(pRouter)
         enc.setBuffer(E.W, offset: Int(mw.router), index: 0)
-        enc.setBuffer(inp, offset: 0, index: 1)
+        enc.setBuffer(inp, offset: (engine.arch.routerK(L.i) - 1) * d * 2, index: 1)   // its own mix (moe_router_mix)
         enc.setBuffer(logits, offset: 0, index: 2)
         dispatch(enc, "router", MTLSize(width: Embla.experts / 8, height: T, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
         // the shared expert's up projection needs no routing
-        gemm(enc, .plain, epi: 1, w: (mw.sh_w, mw.sh_s, mw.sh_b), x: inp, ldx: 3 * d, y: hsh, ldy: 1024, tokens: T, rows: 1024)
+        let sw = L.sharedWidth
+        gemm(enc, .plain, epi: 1, w: (mw.sh_w, mw.sh_s, mw.sh_b), x: inp, ldx: os * d, y: hsh, ldy: sw, tokens: T, rows: sw)
         barrier(enc)
         enc.setComputePipelineState(pRoute)
         enc.setBuffer(logits, offset: 0, index: 0)
@@ -434,11 +475,11 @@ final class Prefill {
         dispatch(enc, "moe", MTLSize(width: 1, height: 1, depth: 1), MTLSize(width: 128, height: 1, depth: 1))
         // the shared expert's down projection meanwhile
         let (routed, shared) = down[L.i]!
-        gemm(enc, .plain, epi: 0, w: shared, x: hsh, ldx: 1024, y: ysh, ldy: d, tokens: T, rows: d, inputs: 1024)
+        gemm(enc, .plain, epi: 0, w: shared, x: hsh, ldx: sw, y: ysh, ldy: d, tokens: T, rows: d, inputs: sw)
         barrier(enc)
         let maxTiles = T * 8 / bm + Embla.experts
         // routed experts: up (rows of each expert, X gathered by token), then down (K = 512)
-        gemm(enc, .gather, epi: 1, w: (mw.fc_w, mw.fc_s, mw.fc_b), x: inp, ldx: 3 * d, y: hex, ldy: 512, tokens: T * 8, rows: 512,
+        gemm(enc, .gather, epi: 1, w: (mw.fc_w, mw.fc_s, mw.fc_b), x: inp, ldx: os * d, y: hex, ldy: 512, tokens: T * 8, rows: 512,
              experts: (SIMD3(UInt64(512 * 256 * 4), UInt64(512 * 32 * 2), UInt64(512 * 32 * 2)), maxTiles))
         barrier(enc)
         gemm(enc, .experts, epi: 0, w: routed, x: hex, ldx: 512, y: yex, ldy: d, tokens: T * 8, rows: d, inputs: 512,
