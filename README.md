@@ -19,7 +19,8 @@ swift run -c release embla serve --open    # a local server, and the chat page i
 The first `swift run` builds for a minute or so. `serve` listens only on this Mac at
 `http://127.0.0.1:8080`: a chat page at `/` and an OpenAI-compatible API at `/v1`
 (`chat/completions`, `completions`, `models`; streamed or not). OpenAI clients can use
-`base_url="http://127.0.0.1:8080/v1"`; an API key is not required. Options: `--port`, `--host`,
+`base_url="http://127.0.0.1:8080/v1"`; an API key is not required. A conversation's earlier turns
+come from the prefix cache, reported as `usage.prompt_tokens_details.cached_tokens`. Options: `--port`, `--host`,
 `--context` (the longest conversation in tokens, default 32768) and `--model` (another repo in
 the cache, or a directory).
 
@@ -61,6 +62,20 @@ Prompts on the iPhone run at 4.7-5.1k tokens a second. Sampling costs ~2% agains
   past 1152 tokens the sparse layers attend the 1024 highest-scoring keys and the 128 latest.
 - **Sampling:** temperature and top-p in the step's last kernel (Gumbel-max over the nucleus), so
   decoding stays pipelined.
+- **Prefix cache:** a prompt that starts like an earlier one, such as a conversation's next turn
+  or another conversation with the same instructions, computes only what is new. Nothing to call:
+  `generate` finds the longest cached start itself. It keeps the live sequence and a store of
+  earlier ones in blocks of 128 positions, shared between sequences that start the same: every
+  block keeps the full layers' keys and values (2.6 KB a token), and a checkpoint block also keeps
+  the sliding layers' window (4 MB). Checkpoints are only at turns, a block end just before each
+  prompt's and each reply's end (one or two a request, however long the prompt), which is where
+  a sequence resumes. The least recently used go past `prefixCacheLimit` (`EMBLA_CACHE_MB`,
+  default 512). On the M5 Pro a 5k-token
+  conversation's next turn starts in 20 to 23 ms instead of 430, also after other conversations
+  ran. With every prompt run as decode steps (`EMBLA_BATCH=0`) a cache hit is bit-identical to
+  computing from scratch (`embla-bench cache`); with the batched prefill, a reused reply was
+  computed by decode steps, so greedy continuations can part at near-ties. `EMBLA_PREFIX_CACHE=0`
+  turns it off.
 - **Checked** against a reference implementation's logits step by step (`embla-bench check`).
 
 ## On an iPhone
@@ -80,6 +95,8 @@ M=$(ls -d ~/.cache/huggingface/hub/models--sevren-ai--Embla1-4bit/snapshots/*/)
 .build/release/embla-bench speed $M 256          # decode tok/s
 .build/release/embla-bench det $M 64             # the same tokens twice: any logit that differs
 .build/release/embla-bench check $M tokens.txt out/   # every step's logits
+.build/release/embla-bench cache $M 1024 64      # prefix cache hits against computing from scratch
+EMBLA_BATCH=0 .build/release/embla-bench cache $M 1024 32   # the same, strict: bit-identical
 ```
 
 Swift 6 (Xcode 16 or later). The libraries: `EmblaMetal` (the engine), `EmblaChat` (tokenizer,

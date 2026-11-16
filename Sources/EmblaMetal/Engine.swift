@@ -51,7 +51,7 @@ public final class Engine: @unchecked Sendable {
     public let weights: SafeTensors
     public let table: EngramTable
     public let maxContext: Int
-    public private(set) var position = 0
+    public internal(set) var position = 0
 
     let W: MTLBuffer, nm: MTLBuffer
     let state, x, hs, qkv, o, hmlp, rlogits, route, part, apart, counter, scores, sel: MTLBuffer
@@ -280,6 +280,8 @@ public final class Engine: @unchecked Sendable {
             cacheBytes += 2 * n
         }
         cache = dev.makeBuffer(length: cacheBytes, options: .storageModePrivate)!
+        slidingRegions = slidingOffset.sorted { $0.key < $1.key }.map(\.value)
+        fullRegions = fullOffset.sorted { $0.key < $1.key }.map(\.value)
 
         // neuron-major down projections, built on the GPU
         let perLayer = 96 * 512 * 256 * 4 + 2 * 96 * 8 * 2048 * 2 + 1024 * 256 * 4 + 2 * 16 * 2048 * 2
@@ -292,13 +294,82 @@ public final class Engine: @unchecked Sendable {
         if batchedPrefill { _ = prefiller }   // compile its pipelines now, not in the first prompt
     }
 
-    /// Clears the caches and the position for a new sequence.
+    /// Clears the caches and the position for a new sequence. `generate` does this itself when the
+    /// prompt shares nothing with what is cached; call it to drop the cache on purpose.
     public func reset() {
         position = 0
+        known = []
+        ringValidFrom = 0
         ids = [UInt64(Embla.vocab), UInt64(Embla.vocab)]
         memset(hist.contents(), 0, hist.length)
         memset(counter.contents(), 0, counter.length)
         memset(greedy.contents(), 0, 4)
+    }
+
+    // ------------------------------------------------------------------ prefix cache
+
+    /// Reuse cached keys and values for the start of a prompt (on by default; EMBLA_PREFIX_CACHE=0
+    /// turns it off). See `generate`.
+    public var prefixCaching = ProcessInfo.processInfo.environment["EMBLA_PREFIX_CACHE"] != "0"
+    /// The tokens whose keys and values are in the live caches, positions 0 ..< `position`.
+    public var cachedTokens: [Int] { Array(known.prefix(position)) }
+    /// Prompt tokens the last `generate` took from the cache instead of computing them.
+    public private(set) var reusedTokens = 0
+
+    /// Earlier sequences' keys and values (`PrefixCache`), beside the live caches.
+    let prefixStore = PrefixCache(limit: (Int(ProcessInfo.processInfo.environment["EMBLA_CACHE_MB"] ?? "") ?? 512) << 20)
+    /// Most bytes the store of earlier sequences holds (EMBLA_CACHE_MB, default 512 MB): the least
+    /// recently used go past it. 0 keeps only the live sequence.
+    public var prefixCacheLimit: Int {
+        get { prefixStore.limit }
+        set { prefixStore.limit = max(0, newValue); prefixStore.evict() }
+    }
+    /// Bytes the store holds now, and its blocks of 128 positions.
+    public var prefixCacheBytes: Int { prefixStore.bytes }
+    public var prefixCacheBlocks: Int { prefixStore.count }
+
+    /// Drops every stored sequence and the live one.
+    public func clearPrefixCache() {
+        prefixStore.removeAll()
+        reset()
+    }
+
+    /// The byte offsets of the sliding and full layers' caches in `cache`, k then v, by layer.
+    var slidingRegions: [(Int, Int)] = [], fullRegions: [(Int, Int)] = []
+    /// The first position whose sliding-layer rows and engram conv inputs in the rings are this
+    /// sequence's: 0, or a restored checkpoint's first position (the slots before it hold another
+    /// sequence's).
+    var ringValidFrom = 0
+
+    /// How many first tokens `prompt` shares with the live caches (at most its length - 1: its
+    /// last token's logits pick the first new token).
+    func livePrefix(_ prompt: [Int]) -> Int {
+        let limit = min(position, known.count, prompt.count - 1)
+        var n = 0
+        while n < limit && known[n] == prompt[n] { n += 1 }
+        return n
+    }
+
+    /// Where `prompt` can resume in the live caches: `livePrefix`, unless the window before it is
+    /// gone. Decoding at n reads the sliding layers' and the engram conv's rows of up to
+    /// `Embla.window` positions before it, which must be this sequence's (`ringValidFrom`) and not
+    /// yet overwritten by later positions in rings of `ring`.
+    func reusablePrefix(_ prompt: [Int], live n: Int) -> Int {
+        guard prefixCaching, !noWait else { return 0 }
+        if position - n > Self.ring - Embla.window || max(0, n - Embla.window) < ringValidFrom { return 0 }
+        return n
+    }
+
+    /// Continues the sequence at position n: the caches of positions 0 ..< n are `tokens`' first n.
+    func resume(at n: Int, tokens: [Int]) {
+        position = n
+        known = Array(tokens.prefix(n))
+        memset(counter.contents(), 0, counter.length)
+        memset(greedy.contents(), 0, 4)   // the word the CPU polls: no step's tag
+        // the step at position n waits for engramReady to pass engramBase + n + 1: above what is
+        // signaled now (a shared event only counts up, so it is raised first if it is below n)
+        if engramReady.signaledValue < UInt64(n) { engramReady.signaledValue = UInt64(n) }
+        engramBase = engramReady.signaledValue - UInt64(n)
     }
 
     // ------------------------------------------------------------------ weights
@@ -924,7 +995,7 @@ public final class Engine: @unchecked Sendable {
     /// The sequence's tokens as the CPU knows them (the prompt's, then each step's from the word it
     /// polls): what the engram rows are read for. The GPU's copy in `tokens`, read before its step
     /// completes, could still hold an old value, and the rows were then another token's.
-    private var known: [Int] = []
+    var known: [Int] = []
     private func knownToken(_ q: Int) -> UInt64 { q < 0 ? UInt64(Embla.vocab) : UInt64(known[q]) }
 
     /// CPU seconds spent reading engram rows, and waiting for steps, in `generate` (profiling).
@@ -943,7 +1014,8 @@ public final class Engine: @unchecked Sendable {
     lazy var prefillRows: MTLSharedEvent = ctx.device.makeSharedEvent()!
     var prefillRowsValue: UInt64 = 0
 
-    /// Batched prefill of positions 0 ..< n (their tokens in `tokens`): chunks of up to
+    /// Batched prefill of positions start ..< n (their tokens in `tokens`; the caches of the
+    /// positions before `start` already filled): chunks of up to
     /// `Prefill.chunk` tokens, each submitted before its engram rows are read. A chunk's command
     /// buffer waits for them only after layer 0 (an event the CPU signals), so the reads overlap
     /// the embedding and layer 0, and no chunk has to be short for them: a short chunk costs the
@@ -958,7 +1030,7 @@ public final class Engine: @unchecked Sendable {
         if trace, let t0 = traceStart { print(String(format: "trace: %@ %.2f ms", what, (CACurrentMediaTime() - t0) * 1e3)) }
     }
 
-    func prefill(upTo n: Int) -> [MTLCommandBuffer] {
+    func prefill(from start: Int = 0, upTo n: Int) -> [MTLCommandBuffer] {
         let pf = prefiller, T = Prefill.chunk
         prefillGPU = 0
         prefillRead = 0
@@ -972,7 +1044,7 @@ public final class Engine: @unchecked Sendable {
             }
             prefillRead += Date().timeIntervalSince(r0)
         }
-        let starts = Array(stride(from: 0, to: n, by: T)) + [n]
+        let starts = Array(stride(from: start, to: n, by: T)) + [n]
         var submitted: [MTLCommandBuffer] = []
         for c in 0 ..< starts.count - 1 {
             // half c % 2 of e was chunk c - 2's
@@ -1111,12 +1183,32 @@ public final class Engine: @unchecked Sendable {
     /// `sampling` picks the tokens; `onToken`, called with each new token as soon as the next
     /// step is under way, ends generation early by returning false (one step more has then run,
     /// and its token is dropped).
+    ///
+    /// Prefix cache: a prompt that starts like an earlier sequence (the next turn of a conversation,
+    /// another conversation with the same instructions) takes the keys and values of that start from
+    /// the cache and computes only the rest; `reusedTokens` says how much. The cache is the live
+    /// sequence (`cachedTokens`: the last prompt and its new tokens), which resumes anywhere, and the
+    /// store of earlier ones (`PrefixCache`), which resumes at its checkpoints, within
+    /// `prefixCacheLimit`. Computed the same way, the result is the same bit for bit; a reused
+    /// reply's positions were computed by decode steps where computing from scratch runs them
+    /// through the batched prefill, which differs slightly (README). `prefixCaching = false`
+    /// (EMBLA_PREFIX_CACHE=0) always starts over.
     public func generate(prompt: [Int], count: Int, sampling: Sampling = .greedy,
                          onToken: (Int) -> Bool = { _ in true }) -> (tokens: [Int], wallPerToken: Double, gpuPerStep: Double) {
         precondition(!prompt.isEmpty && count > 0, "need a prompt and a token to generate")
-        reset()
+        // the live caches, or a stored sequence that goes further (restored into the caches)
+        let live = prefixCaching && !noWait ? livePrefix(prompt) : 0
+        var reuse = reusablePrefix(prompt, live: live)
+        if prefixCaching, !noWait, let start = restoreFromStore(prompt, live: live, beyond: reuse) {
+            reuse = start
+        } else if reuse > 0 {
+            resume(at: reuse, tokens: prompt)
+        } else {
+            reset()
+            engramBase = engramReady.signaledValue
+        }
+        reusedTokens = reuse
         self.sampling = sampling
-        engramBase = engramReady.signaledValue
         engramSeconds = 0
         waitSeconds = 0
         precondition(prompt.count + count < maxContext, "context full")
@@ -1131,10 +1223,11 @@ public final class Engine: @unchecked Sendable {
         // known), up to engramRing ahead of the GPU; all but the last stop at layer 16
         let promptStart = Date()
         traceStart = CACurrentMediaTime()
-        var first = 0
+        // positions before `reuse` are in the cache already
+        var first = reuse
         var prefilling: [MTLCommandBuffer] = []
-        if batchedPrefill && !fullPrompt && P > 1 {
-            prefilling = prefill(upTo: P - 1)
+        if batchedPrefill && !fullPrompt && P - 1 > reuse {
+            prefilling = prefill(from: reuse, upTo: P - 1)
             first = P - 1
         }
         for q in first ..< P {
@@ -1201,7 +1294,12 @@ public final class Engine: @unchecked Sendable {
         gaps = (median(tail.map { $0.0.gpuEndTime - $0.0.gpuStartTime }), median(tail.map { $0.1.gpuStartTime - $0.0.gpuEndTime }),
                 median(tail.map { $0.1.gpuEndTime - $0.1.gpuStartTime }),
                 median(zip(tail.dropFirst(), tail).map { $0.0.0.gpuStartTime - $0.1.1.gpuEndTime }))
-        return (Array(known[P ..< P + count]), wall, gpu)
+        let new = Array(known[P ..< P + count])
+        // The cache now holds positions 0 ..< position: the prompt and every new token but the last
+        // (no step has run it). Profiling with noWait leaves the new tokens unknown: keep the prompt.
+        known.removeLast(known.count - (noWait ? min(P, position) : position))
+        if prefixCaching && !noWait { saveToStore(turnEnds: [P, position]) }
+        return (new, wall, gpu)
     }
 }
 

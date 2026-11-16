@@ -9,6 +9,7 @@ func runSpeed(_ args: [String]) throws {
     let n = args.count > 1 ? Int(args[1])! : 128
     let context = args.count > 2 ? Int(args[2])! : 0
     let engine = try Engine(modelDirectory: URL(fileURLWithPath: args[0]), maxContext: max(4096, context + 2 * n + 64))
+    engine.prefixCaching = false   // every run computes the whole prompt
     var prompt = [758, 6426, 314, 29103, 368]
     while prompt.count < context { prompt += [13, 198, 758, 6426, 314, 29103, 368, 46447] }
     if let file = ProcessInfo.processInfo.environment["EMBLA_PROMPT_FILE"] {   // real text instead of the pattern
