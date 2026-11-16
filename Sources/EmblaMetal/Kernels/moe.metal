@@ -9,7 +9,13 @@
 #define MR 1
 #endif
 
-constant constexpr int E = 96, TOPK = 8, F = 512, FS = 1024, KW = D / 8;
+#ifndef SH
+#define SH 1024   // the shared expert's width (Embla 1.1's layer 0: 2048)
+#endif
+#ifndef RK
+#define RK 1      // the router's mixes: 1, its input the MLP's; 2 (moe_router_mix), its own after the MLP's
+#endif
+constant constexpr int E = 96, TOPK = 8, F = 512, FS = SH, KW = D / 8;
 #ifndef RSG
 #define RSG 8     // router rows (simdgroups) a threadgroup
 #endif
@@ -53,14 +59,15 @@ kernel void moe_router(
     bfloat4 rw[16];
     device const bfloat4* wp = (device const bfloat4*)(W + mw.router) + row * (D / 4);
     for (int i = 0; i < 16; i++) rw[i] = wp[i * 32 + lane];
-    threadgroup bfloat xm[D];
-    threadgroup float red[RSG * 3 + 2];
-    mix_input<1, HAS_X, RSG * 32>(queries, m0, stats, col, xres, xm, hm, tg == 0, red, t, lane, sg);
+    threadgroup bfloat xm[RK * D];
+    threadgroup float red[RSG * (2 * RK + 1) + 2 * RK];
+    // RK 2: columns col (the experts' input, to hm) and col + 1 (the router's, scored here only)
+    mix_input<RK, HAS_X, RSG * 32, 1>(queries, m0, stats, col, xres, xm, hm, tg == 0, red, t, lane, sg);
     float acc = 0.0f;
-    threadgroup const bfloat4* x4 = (threadgroup const bfloat4*)xm;
+    threadgroup const bfloat4* x4 = (threadgroup const bfloat4*)(xm + (RK - 1) * D);
     for (int i = 0; i < 16; i++) acc += dot(float4(rw[i]), float4(x4[i * 32 + lane]));
     acc = simd_sum(acc);
-    if (lane == 0) logits[row] = acc;
+    if (lane == 0) store_shared(logits + row, acc);
 
     threadgroup bool last;
     if (!arrive_last(counter, ROUTER_TGS, t, &last) || sg != 0) return;
@@ -69,7 +76,7 @@ kernel void moe_router(
     float score[RR], biased[RR];
     for (int i = 0; i < RR; i++) {
         const int e = int(lane) + 32 * i;
-        const float l = logits[e];
+        const float l = load_shared(logits + e);
         const float y = 1.0f / (1.0f + precise::exp(fabs(l)));
         score[i] = l < 0 ? y : 1.0f - y;
         biased[i] = score[i] + float(bias[e]);
@@ -290,7 +297,7 @@ kernel void moe_reduce(
     if (int(t) < NP) {
         float v = 0.0f;
         for (int i = 0; i < 8; i++) v += red[i][t];
-        dots[tg * NP + t] = v;
+        store_shared(dots + tg * NP + t, v);
     }
     // the last threadgroup to finish: the mixes, from every threadgroup's sums and the new x
     threadgroup bool last;
@@ -298,7 +305,7 @@ kernel void moe_reduce(
     float tot[NP];
     for (int p = 0; p < NP; p++) {
         float v = 0.0f;
-        for (int i = 0; i < NTG; i++) v += dots[i * NP + p];
+        for (int i = 0; i < NTG; i++) v += load_shared(dots + i * NP + p);
         tot[p] = v;
     }
     const float xx = tot[2 * MIXK], rx = precise::rsqrt(xx / D + EPS);

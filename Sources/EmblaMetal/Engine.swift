@@ -50,12 +50,18 @@ public final class Engine: @unchecked Sendable {
     public let ctx: MetalContext
     public let weights: SafeTensors
     public let table: EngramTable
+    /// The model's shape from its config.json: Embla 1, or Embla 1.1's changes (docs/EMBLA_1_1.md).
+    public let arch: Arch
     public let maxContext: Int
     public private(set) var position = 0
 
     let W: MTLBuffer, nm: MTLBuffer
     let state, x, hs, qkv, o, hmlp, rlogits, route, part, apart, counter, scores, sel: MTLBuffer
     let e, ekv, hist, cache, tokens, greedy, m0, stats: MTLBuffer
+    /// The loop (Embla 1.1): the looped blocks' fp32 sums before their bf16 store [3][D] (pass 1's
+    /// blocks, pass 2's first; its last is x itself), every source slot's logit offset [slots]
+    /// (loop_src_bias on the looped blocks and their b*) and loop_alpha [D], both f32.
+    let loopSums, offs, alpha: MTLBuffer
     /// Learn each step's token by polling the word the argmax writes for the CPU (greedy[-1]), which
     /// the CPU sees ~60 µs before the command buffer's completion (EMBLA_POLL=0: wait for it).
     /// The other direction, CPU to GPU, goes through `engramReady`: a GPU kernel spinning on memory
@@ -124,6 +130,9 @@ public final class Engine: @unchecked Sendable {
         let kOffset: Int, vOffset: Int   // bytes into `cache`: sliding ring, or the attended full layer
         let dense: (fc: [Seg], proj: [Seg])?
         let moe: MoEWeights?
+        /// The fused MoE's pipelines for this layer's shared expert width (and the shared slices alone).
+        let fused: MTLComputePipelineState?, sharedPipe: MTLComputePipelineState?
+        let sharedWidth: Int
         /// The q/k/v GEMV reads its input mixes from hs, written by the layer before's MoE reduce
         /// (or by prep at a block start), instead of computing them in every threadgroup.
         var premixed = false
@@ -132,6 +141,9 @@ public final class Engine: @unchecked Sendable {
     }
 
     var layers: [Layer] = []
+    /// The loop's second pass (Embla 1.1): its layers' plans, encoded after the first pass's last layer
+    /// (the same weights; the loop's query columns, their own sliding rings).
+    var twins: [Layer] = []
     var engramMix: Mix!, finalMix: Mix!
     var engramSegs: [Seg] = [], lmHead: [Seg] = []
     var wte: (UInt64, UInt64, UInt64) = (0, 0, 0)
@@ -182,8 +194,17 @@ public final class Engine: @unchecked Sendable {
     }
 
     public static func kernelSource(_ name: String) throws -> String {
-        try (kv8 ? "#define KV8 1\n" : "") + kernelFile("common") + "\n" + kernelFile(name)
+        try (kv8 ? "#define KV8 1\n" : "") + (crossAtomic ? "#define XTG_ATOMIC 1\n" : "") + kernelFile("common") + "\n" + kernelFile(name)
     }
+
+    /// GPUs before Apple9 (the M1 and M2): what one threadgroup writes for the dispatch's last
+    /// threadgroup (arrive_last) goes through atomics (common.metal's store_shared); EMBLA_XTG=0 / 1
+    /// overrides.
+    static let crossAtomic: Bool = {
+        if let v = ProcessInfo.processInfo.environment["EMBLA_XTG"] { return v == "1" }
+        guard let dev = MTLCreateSystemDefaultDevice() else { return false }
+        return !dev.supportsFamily(.apple9)
+    }()
 
     /// Kernel work on a device: a directory whose `<name>.metal` files replace the built-in ones
     /// (EMBLA_KERNELS; relative to the app's Documents on iOS), so a kernel can change without a
@@ -209,6 +230,7 @@ public final class Engine: @unchecked Sendable {
         let ctx = try ctx ?? MetalContext()
         self.ctx = ctx
         self.maxContext = maxContext
+        arch = try Arch.load(modelDirectory)
         weights = try SafeTensors(url: modelDirectory.appendingPathComponent("model.safetensors"), device: ctx.device)
         table = try EngramTable(url: modelDirectory.appendingPathComponent("engram_table.safetensors"))
         W = weights.buffer
@@ -241,15 +263,18 @@ public final class Engine: @unchecked Sendable {
         // activations
         func buf(_ bytes: Int) -> MTLBuffer { dev.makeBuffer(length: bytes, options: .storageModeShared)! }
         let d = Embla.d
-        state = buf(9 * d * 2)
+        state = buf(arch.slots * d * 2)
         x = buf(d * 4)
-        hs = buf(3 * d * 2)
+        hs = buf(arch.outMixes * d * 2)
+        loopSums = buf(3 * d * 4)
+        offs = buf(arch.slots * 4)
+        alpha = buf(d * 4)
         qkv = buf(4096 * 2)
         o = buf(d * 2)
         hmlp = buf(d * 2)
         rlogits = buf(Embla.experts * 4)
         route = buf(16 * 4)
-        part = buf(80 * d * 4)
+        part = buf((8 * Embla.expertDim + arch.shared.max()!) / 64 * d * 4)   // the fused MoE's slices
         apart = buf((maxContext / 64 + 2) * 16 * 130 * 4)
         counter = buf(64)
         scores = buf(2 * maxContext * 4)
@@ -261,17 +286,22 @@ public final class Engine: @unchecked Sendable {
         greedy = buf((maxContext + 3) * 4)
         engramReady = dev.makeSharedEvent()!
         gpuChain = dev.makeEvent()!
-        m0 = buf(80 * d * 2)
-        stats = buf(80 * 16)
+        m0 = buf(max(80, arch.queryCount) * d * 2)   // prep's M0 and stats of every query column
+        stats = buf(max(80, arch.queryCount) * 16)
         logits = buf(Embla.vocab * 4)
         sampleScratch = buf(Embla.vocab * 4)
 
-        // caches: 15 sliding rings [4][128][128], then 5 full [2][maxContext][128], k then v each
-        // (with KV8 int8 rows, then their [2][maxContext] float scales)
+        // caches: 15 sliding rings [4][RING][128] (then the loop's second pass's, one a looped
+        // layer), then 5 full [2][maxContext][128], k then v each (with KV8 int8 rows, then their
+        // [2][maxContext] float scales)
         var cacheBytes = 0
-        var slidingOffset: [Int: (Int, Int)] = [:], fullOffset: [Int: (Int, Int)] = [:]
+        var slidingOffset: [Int: (Int, Int)] = [:], fullOffset: [Int: (Int, Int)] = [:], loopOffset: [Int: (Int, Int)] = [:]
         for i in 0 ..< Embla.layers where Embla.kinds[i] == .sliding {
             slidingOffset[i] = (cacheBytes, cacheBytes + 4 * Self.ring * 128 * 2)
+            cacheBytes += 2 * 4 * Self.ring * 128 * 2
+        }
+        for i in arch.loop ?? 0 ..< 0 {
+            loopOffset[i] = (cacheBytes, cacheBytes + 4 * Self.ring * 128 * 2)
             cacheBytes += 2 * 4 * Self.ring * 128 * 2
         }
         for i in 0 ..< Embla.layers where Embla.kinds[i] == .full {
@@ -281,13 +311,20 @@ public final class Engine: @unchecked Sendable {
         }
         cache = dev.makeBuffer(length: cacheBytes, options: .storageModePrivate)!
 
-        // neuron-major down projections, built on the GPU
-        let perLayer = 96 * 512 * 256 * 4 + 2 * 96 * 8 * 2048 * 2 + 1024 * 256 * 4 + 2 * 16 * 2048 * 2
-        nm = dev.makeBuffer(length: 31 * perLayer, options: .storageModePrivate)!
+        // neuron-major down projections, built on the GPU: each MoE layer's routed experts' and
+        // shared expert's, at nmOffset[layer]
+        var nmOffset: [Int: Int] = [:], nmBytes = 0
+        for i in 0 ..< Embla.layers where !arch.dense.contains(i) {
+            nmOffset[i] = nmBytes
+            nmBytes += 96 * 512 * 256 * 4 + 2 * 96 * 8 * 2048 * 2 + arch.shared[i] * 256 * 4 + 2 * arch.shared[i] / 64 * 2048 * 2
+        }
+        nm = dev.makeBuffer(length: nmBytes, options: .storageModePrivate)!
 
-        try buildPlans(slidingOffset: slidingOffset, fullOffset: fullOffset, perLayer: perLayer)
-        try buildNeuronMajor(perLayer: perLayer, source: misc)
+        try buildPlans(slidingOffset: slidingOffset, loopOffset: loopOffset, fullOffset: fullOffset, nmOffset: nmOffset)
+        try buildNeuronMajor(source: misc)
+        try buildLoop()
         try buildQueries()
+        precondition(queryNames.count == arch.queryCount, "query columns")
         reset()
         if batchedPrefill { _ = prefiller }   // compile its pipelines now, not in the first prompt
     }
@@ -313,58 +350,121 @@ public final class Engine: @unchecked Sendable {
         return Seg(w: UInt64(w.offset), s: UInt64(s.offset), b: UInt64(b.offset), end: UInt32(end), x: UInt32(x), y: UInt32(y))
     }
 
-    private func mix(n: Int, k: Int, hasX: Bool, norm: Bool, append: Bool, col: Int) throws -> Mix {
-        let p = try ctx.pipeline("mix", source: Self.kernelSource("mix"), macros: [
-            "N": n, "K": k, "HAS_X": hasX ? 1 : 0, "NORM": norm ? 1 : 0, "APPEND": append ? 1 : 0,
-        ])
+    /// mix.metal's macros for the loop's options (Embla 1's pipelines take none of them).
+    private func loopMacros(offs: Bool, keep: Int, star: Bool) -> [String: Int] {
+        var m: [String: Int] = [:]
+        if arch.slots != 9 { m["SLOTS"] = arch.slots }
+        if offs { m["OFFS"] = 1 }
+        if keep > 0 { m["KEEP"] = keep }
+        if star { m["STAR"] = 1 }
+        return m
+    }
+
+    private func mix(n: Int, k: Int, hasX: Bool, norm: Bool, append: Bool, col: Int, offs: Bool = false) throws -> Mix {
+        let p = try mixPipeline(ctx, ["N": n, "K": k, "HAS_X": hasX ? 1 : 0, "NORM": norm ? 1 : 0, "APPEND": append ? 1 : 0]
+            .merging(loopMacros(offs: offs, keep: 0, star: false)) { a, _ in a })
         return Mix(pipeline: p, col: Int32(col), k: k)
     }
 
-    /// prep for the columns cols, over n sources (the last one appended from x with `append`).
-    private func prep(n: Int, append: Bool, cols: Range<Int>, kout: Int = 0) throws -> (pipe: MTLComputePipelineState, col: Int32, count: Int) {
+    /// mix.metal's `mix` (a threadgroup of 1024 threads a token): with LOWREG when the plain kernel
+    /// needs more registers than 1024 threads have (Embla 1.1's final mix over 11 sources, layer
+    /// 16's 5 mixes in prefill; every Embla 1 mix runs 1024 as it is).
+    func mixPipeline(_ ctx: MetalContext, _ macros: [String: Int]) throws -> MTLComputePipelineState {
+        let p = try ctx.pipeline("mix", source: Self.kernelSource("mix"), macros: macros)
+        if p.maxTotalThreadsPerThreadgroup >= 1024 { return p }
+        let q = try ctx.pipeline("mix", source: Self.kernelSource("mix"), macros: macros.merging(["LOWREG": 1]) { a, _ in a })
+        guard q.maxTotalThreadsPerThreadgroup >= 1024 else { throw EmblaError.unsupported("mix \(macros): \(q.maxTotalThreadsPerThreadgroup) threads") }
+        return q
+    }
+
+    /// prep for the columns cols, over n sources (the last one appended from x with `append`, kept in
+    /// loopSums row keep - 1 with keep; the last two the looped blocks' b* with `star`; the logits
+    /// offset with `offs`).
+    private func prep(n: Int, append: Bool, cols: Range<Int>, kout: Int = 0, offs: Bool = false, keep: Int = 0,
+                      star: Bool = false) throws -> (pipe: MTLComputePipelineState, col: Int32, count: Int) {
         let p = try ctx.pipeline("prep", source: Self.kernelSource("mix"), macros: [
             "N": n, "K": 1, "HAS_X": 0, "NORM": 0, "APPEND": append ? 1 : 0, "KOUT": kout,
-        ])
+        ].merging(loopMacros(offs: offs, keep: keep, star: star)) { a, _ in a })
         return (p, Int32(cols.lowerBound), cols.count)
     }
 
     var queryNames: [String] = []
+    /// Query columns by name: "attn<i>", "mlp<i>", "end<i>" (after layer i's), and the loop's second
+    /// pass's "attn2_<i>", "mlp2_<i>", "end2_<i>"; "engram", "final".
+    var cols: [String: Int] = [:]
 
-    private func buildPlans(slidingOffset: [Int: (Int, Int)], fullOffset: [Int: (Int, Int)], perLayer: Int) throws {
-        // pseudo-query columns, in the reference's order
-        var cols: [String: Int] = [:]
+    private func buildPlans(slidingOffset: [Int: (Int, Int)], loopOffset: [Int: (Int, Int)], fullOffset: [Int: (Int, Int)],
+                            nmOffset: [Int: Int]) throws {
+        // pseudo-query columns, in the reference's order (`_res_queries`): a layer's attention query, its
+        // own K/V mix's, its bridged layers'; its MLP's, its router's; then the loop's (`_loop_queries`)
         for i in 0 ..< Embla.layers {
             cols["attn\(i)"] = queryNames.count
             queryNames.append("transformer.h.\(i).attn_res_query")
-            for j in Embla.bridges[i] ?? [] { queryNames.append("transformer.h.\(j).kv_res_query") }
+            if arch.kvMix.contains(i) { queryNames.append("transformer.h.\(i).kv_res_query") }
+            for j in arch.bridges[i] ?? [] { queryNames.append("transformer.h.\(j).kv_res_query") }
             cols["mlp\(i)"] = queryNames.count
             queryNames.append("transformer.h.\(i).mlp_res_query")
+            if arch.routerK(i) == 2 { queryNames.append("transformer.h.\(i).router_res_query") }
+            cols["end\(i)"] = queryNames.count
         }
         cols["engram"] = queryNames.count
         queryNames.append("engram_res_query")
         cols["final"] = queryNames.count
         queryNames.append("final_res_query")
+        for i in arch.loop ?? 0 ..< 0 {
+            cols["attn2_\(i)"] = queryNames.count
+            queryNames.append("transformer.h.\(i).loop_attn_res_query")
+            cols["mlp2_\(i)"] = queryNames.count
+            queryNames.append("transformer.h.\(i).loop_mlp_res_query")
+            if arch.routerK(i) == 2 { queryNames.append("transformer.h.\(i).loop_router_res_query") }
+            cols["end2_\(i)"] = queryNames.count
+        }
 
-        for i in 0 ..< Embla.layers {
+        let gemvSource = try Self.kernelSource("gemv"), moeSource = try Self.kernelSource("moe")
+        var fusedPipes: [Int: (MTLComputePipelineState, MTLComputePipelineState)] = [Embla.sharedDim: (pFused, pShared)]
+        for w in Set(arch.shared) where fusedPipes[w] == nil {
+            let m = Self.envMacros("EMBLA_FUSED").merging(["SH": w]) { a, _ in a }
+            fusedPipes[w] = (try ctx.pipeline("moe_fused", source: moeSource, macros: m.merging(["PART": Self.sharedBeside ? 1 : 0]) { a, _ in a }),
+                             try ctx.pipeline("moe_fused", source: moeSource, macros: m.merging(["PART": 2]) { a, _ in a }))
+        }
+
+        /// Layer i's plan: the first pass's, or (`pass2`) the loop's second pass's.
+        func plan(_ i: Int, pass2: Bool) throws -> Layer {
             let kind = Embla.kinds[i], p = "transformer.h.\(i)."
             let blockStart = i % Embla.blockSize == 0
-            // sources: the embedding, the engram (after layer 0), each completed block
-            let n = i == 0 ? 1 : 2 + i / Embla.blockSize
-            let bridged = Embla.bridges[i] ?? []
-            let attnK = 1 + bridged.count
-            let gemvSource = try Self.kernelSource("gemv")
+            let c = { (name: String, l: Int) in self.cols[pass2 ? "\(name)2_\(l)" : "\(name)\(l)"]! }
+            let bridged = pass2 ? [] : arch.bridges[i] ?? []
+            let attnK = pass2 ? 1 : arch.attnK(i)
             let qkvPipe = premix && i >= 2
                 ? try ctx.pipeline("gemv", source: gemvSource, macros: ["EPI": 0, "ROWS": Self.gemvRows])
                 : try ctx.pipeline("gemv", source: gemvSource, macros: [
                     "EPI": 0, "MIX": 1, "K": attnK, "HAS_X": blockStart ? 0 : 1, "ROWS": Self.mixRows])
-            let mlpPipe = i == 0
+            let isDense = arch.dense.contains(i)
+            var routerMacros = ["HAS_X": 1, "RSG": routerRows]
+            if arch.routerK(i) == 2 { routerMacros["RK"] = 2 }
+            let mlpPipe = isDense
                 ? try ctx.pipeline("gemv", source: gemvSource, macros: ["EPI": 1, "MIX": 1, "K": 1, "HAS_X": 1, "ROWS": Self.mixRows])
-                : try ctx.pipeline("moe_router", source: Self.kernelSource("moe"), macros: ["HAS_X": 1, "RSG": routerRows])
+                : try ctx.pipeline("moe_router", source: moeSource, macros: routerMacros)
             // sources change at each block start (a completed block is appended), and after the
             // engram (layer 1; prep1, encoded after the engram gate)
             let premixed = premix && i >= 2
-            let blockPrep = blockStart && i > 0
-                ? try prep(n: n, append: true, cols: cols["attn\(i)"]! ..< cols["mlp\(i + 3)"]! + 1, kout: premixed ? attnK : 0) : nil
+            var blockPrep: (pipe: MTLComputePipelineState, col: Int32, count: Int)? = nil
+            if blockStart && i > 0 {
+                let range = c("attn", i) ..< c("end", i + Embla.blockSize - 1), kout = premixed ? attnK : 0
+                if pass2, let l = arch.loop {
+                    // the second pass: every source so far (pass 1's looped blocks, its own completed);
+                    // at its start pass 1's last block completes (kept: row 1), then its own first (row 2)
+                    let n = 2 + l.upperBound / Embla.blockSize + (i - l.lowerBound) / Embla.blockSize
+                    blockPrep = try prep(n: n, append: true, cols: range, kout: kout, keep: i == l.lowerBound ? 2 : 3)
+                } else if let l = arch.loop, i == l.upperBound {
+                    // after the loop: b* of each looped block (pass 1's last block was appended at pass 2's start)
+                    blockPrep = try prep(n: arch.sources(i), append: false, cols: range, kout: kout, offs: true, star: true)
+                } else if let l = arch.loop, i > l.lowerBound && i < l.upperBound {   // a looped block completes: its x kept (row 0)
+                    blockPrep = try prep(n: arch.sources(i), append: true, cols: range, kout: kout, keep: 1)
+                } else {
+                    blockPrep = try prep(n: arch.sources(i), append: true, cols: range, kout: kout, offs: arch.loop.map { i > $0.upperBound } ?? false)
+                }
+            }
 
             var end = 0
             var qkvSegs = [try seg(p + "attn.c_q", end: &end, x: 0, y: 0)]
@@ -374,14 +474,16 @@ public final class Engine: @unchecked Sendable {
             case .sliding:
                 qkvSegs.append(try seg(p + "attn.c_k", end: &end, x: 0, y: 2048))
                 qkvSegs.append(try seg(p + "attn.c_v", end: &end, x: 0, y: 2560))
-                (kOff, vOff) = slidingOffset[i]!
+                (kOff, vOff) = pass2 ? loopOffset[i]! : slidingOffset[i]!
             case .full:
-                if Embla.kvSources[i] == i {
+                if arch.kvSources[i] == i {
+                    // input rows: the query's (0), the layer's own K/V mix's (kv_mix_layers), the bridged layers'
+                    let own = arch.kvMix.contains(i) ? 1 : 0
                     for (m, j) in ([i] + bridged).enumerated() {
                         let pj = "transformer.h.\(j)."
                         let ky = m == 0 ? 2048 : 2560 + (m - 1) * 512
-                        qkvSegs.append(try seg(pj + "attn.c_k", end: &end, x: m * 2048, y: ky))
-                        qkvSegs.append(try seg(pj + "attn.c_v", end: &end, x: m * 2048, y: ky + 256))
+                        qkvSegs.append(try seg(pj + "attn.c_k", end: &end, x: (m + own) * 2048, y: ky))
+                        qkvSegs.append(try seg(pj + "attn.c_v", end: &end, x: (m + own) * 2048, y: ky + 256))
                         let (kc, vc) = fullOffset[j]!
                         jobs.append(KVJob(k: UInt32(ky), v: UInt32(ky + 256), kc: UInt32(Self.kv8 ? kc : kc / 2), vc: UInt32(Self.kv8 ? vc : vc / 2)))
                     }
@@ -395,13 +497,14 @@ public final class Engine: @unchecked Sendable {
 
             var dense: ([Seg], [Seg])? = nil
             var moe: MoEWeights? = nil
-            if i == 0 {
+            let w = arch.shared[i]
+            if isDense {
                 var e1 = 0, e2 = 0
                 dense = ([try seg(p + "mlp.c_fc", end: &e1, x: 0, y: 0)], [try seg(p + "mlp.c_proj", end: &e2, x: 0, y: 0)])
             } else {
-                let base = UInt64((i - 1) * perLayer)
+                let base = UInt64(nmOffset[i]!)
                 let pw = base, ps = pw + UInt64(96 * 512 * 256 * 4), pb = ps + UInt64(96 * 8 * 2048 * 2)
-                let spw = pb + UInt64(96 * 8 * 2048 * 2), sps = spw + UInt64(1024 * 256 * 4), spb = sps + UInt64(16 * 2048 * 2)
+                let spw = pb + UInt64(96 * 8 * 2048 * 2), sps = spw + UInt64(w * 256 * 4), spb = sps + UInt64(w / 64 * 2048 * 2)
                 func off(_ n: String) throws -> UInt64 { UInt64(try t(p + "mlp." + n).offset) }
                 moe = MoEWeights(
                     router: try off("router.weight"), fc_w: try off("experts_fc.weight"), fc_s: try off("experts_fc.scales"), fc_b: try off("experts_fc.biases"),
@@ -410,29 +513,41 @@ public final class Engine: @unchecked Sendable {
             }
             let sliding = kind == .sliding
             var layer = Layer(
-                i: i, kind: kind, qkvPipe: qkvPipe, mlpPipe: mlpPipe, attnCol: Int32(cols["attn\(i)"]!), attnK: attnK,
-                mlpCol: Int32(cols["mlp\(i)"]!), prep: blockPrep, qkv: qkvSegs, oproj: oproj, oFirst: blockStart,
+                i: i, kind: kind, qkvPipe: qkvPipe, mlpPipe: mlpPipe, attnCol: Int32(c("attn", i)), attnK: attnK,
+                mlpCol: Int32(c("mlp", i)), prep: blockPrep, qkv: qkvSegs, oproj: oproj, oFirst: blockStart,
                 qGain: try t(p + "attn.q_norm.weight").offset, kGain: try t(p + "attn.k_norm.weight").offset,
-                nGains: sliding ? 1 : 2, kvJobs: jobs, kOffset: kOff, vOffset: vOff, dense: dense, moe: moe)
+                nGains: sliding ? 1 : 2, kvJobs: jobs, kOffset: kOff, vOffset: vOff, dense: dense, moe: moe,
+                fused: isDense ? nil : fusedPipes[w]!.0, sharedPipe: isDense ? nil : fusedPipes[w]!.1, sharedWidth: w)
             layer.premixed = premixed
-            layers.append(layer)
+            return layer
         }
+        layers = try (0 ..< Embla.layers).map { try plan($0, pass2: false) }
+        twins = try (arch.loop ?? 0 ..< 0).map { try plan($0, pass2: true) }
+
         // each MoE layer's reduce: plain, or with the next layer's attention mixes (when that layer
         // is premixed and not a block start, whose prep writes them)
-        for i in 1 ..< Embla.layers {
-            let next = i + 1
-            if premix && next < Embla.layers && next >= 2 && next % Embla.blockSize != 0 {
-                let k = layers[next].attnK
-                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: Self.kernelSource("moe"), macros: ["RG": reduceGroups, "MIXK": k]),
-                                    layers[next].attnCol)
-            } else {
-                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: Self.kernelSource("moe"), macros: ["RG": reduceGroups]), 0)
+        func reduce(_ L: Layer, next: Layer?) throws -> (pipe: MTLComputePipelineState, col: Int32) {
+            var m = ["RG": reduceGroups]
+            if L.sharedWidth != Embla.sharedDim { m["SH"] = L.sharedWidth }
+            if let n = next, n.premixed && n.i % Embla.blockSize != 0 {
+                m["MIXK"] = n.attnK
+                return (try ctx.pipeline("moe_reduce", source: moeSource, macros: m), n.attnCol)
             }
+            return (try ctx.pipeline("moe_reduce", source: moeSource, macros: m), 0)
         }
-        prep0 = try prep(n: 1, append: false, cols: cols["attn0"]! ..< cols["mlp0"]! + 1)
-        prep1 = try prep(n: 2, append: false, cols: cols["attn1"]! ..< cols["mlp3"]! + 1)
+        for i in 0 ..< Embla.layers where layers[i].moe != nil {
+            // the first pass's last looped layer runs before the second pass's first
+            let next = i + 1 == arch.loop?.upperBound ? twins.first : i + 1 < Embla.layers ? layers[i + 1] : nil
+            layers[i].reduce = try reduce(layers[i], next: next)
+        }
+        for k in twins.indices {
+            twins[k].reduce = try reduce(twins[k], next: k + 1 < twins.count ? twins[k + 1] : layers[twins[k].i + 1])
+        }
+        prep0 = try prep(n: 1, append: false, cols: cols["attn0"]! ..< cols["end0"]!)
+        prep1 = try prep(n: 2, append: false, cols: cols["attn1"]! ..< cols["end3"]!)
         engramMix = try mix(n: 1, k: 1, hasX: true, norm: false, append: false, col: cols["engram"]!)
-        finalMix = try mix(n: 9, k: 1, hasX: true, norm: true, append: false, col: cols["final"]!)
+        finalMix = try mix(n: 1 + Embla.layers / Embla.blockSize + arch.loopBlocks, k: 1, hasX: true, norm: true, append: false,
+                           col: cols["final"]!, offs: arch.loop != nil)
         var end = 0
         engramSegs = [try seg("engram.w_k", end: &end, x: 0, y: 0), try seg("engram.w_v", end: &end, x: 0, y: 2048)]
         end = 0
@@ -442,21 +557,51 @@ public final class Engine: @unchecked Sendable {
         convWeight = try t("engram.conv_weight").offset
     }
 
+    /// A [n] vector of the weights (bf16 or f32) as floats.
+    private func floats(_ name: String) throws -> [Float] {
+        let v = try t(name), raw = W.contents() + v.offset
+        let n = v.shape.reduce(1, *)
+        switch v.dtype {
+        case "F32": return (0 ..< n).map { raw.loadUnaligned(fromByteOffset: 4 * $0, as: Float.self) }
+        case "BF16": return (0 ..< n).map { BF16.float(raw.loadUnaligned(fromByteOffset: 2 * $0, as: UInt16.self)) }
+        default: throw EmblaError.badFile("\(name): dtype \(v.dtype)")
+        }
+    }
+
     private func buildQueries() throws {
         let d = Embla.d
         queries = ctx.buffer(Float.self, count: queryNames.count * d)
         let out = queries.contents().assumingMemoryBound(to: Float.self)
         for (q, name) in queryNames.enumerated() {
-            let src = (W.contents() + (try t(name)).offset).assumingMemoryBound(to: UInt16.self)
-            for i in 0 ..< d { out[q * d + i] = BF16.float(src[i]) }
+            let v = try floats(name)
+            precondition(v.count == d, "\(name): [\(d)]")
+            for i in 0 ..< d { out[q * d + i] = v[i] }
         }
     }
 
-    private func buildNeuronMajor(perLayer: Int, source: String) throws {
+    /// The loop's gate and logit offsets (`transformer.loop_alpha`, `transformer.loop_src_bias` [b_0, b*_0, b_1,
+    /// b*_1]): b_j is source slot 2 + lo / 4 + j, b*_j slot 2 + hi / 4 + j.
+    private func buildLoop() throws {
+        memset(offs.contents(), 0, offs.length)
+        memset(alpha.contents(), 0, alpha.length)
+        guard let l = arch.loop else { return }
+        func named(_ n: String) throws -> [Float] { try floats(weights["transformer." + n] != nil ? "transformer." + n : n) }
+        let a = try named("loop_alpha"), bias = try named("loop_src_bias")
+        precondition(a.count == Embla.d && bias.count == 2 * arch.loopBlocks, "loop_alpha [d], loop_src_bias [2 x blocks]")
+        let o = offs.contents().assumingMemoryBound(to: Float.self)
+        for j in 0 ..< arch.loopBlocks {
+            o[2 + l.lowerBound / Embla.blockSize + j] = bias[2 * j]
+            o[2 + l.upperBound / Embla.blockSize + j] = bias[2 * j + 1]
+        }
+        memcpy(alpha.contents(), a, Embla.d * 4)
+    }
+
+    private func buildNeuronMajor(source: String) throws {
         let pT = try ctx.pipeline("nibble_transpose", source: source), p16 = try ctx.pipeline("transpose16", source: source)
-        for i in 1 ..< Embla.layers {
+        for L in layers where L.moe != nil {
+            let i = L.i, sw = L.sharedWidth
             let cb = ctx.queue.makeCommandBuffer()!, enc = cb.makeComputeCommandEncoder()!
-            let m = layers[i].moe!
+            let m = L.moe!
             let p = "transformer.h.\(i).mlp."
             func words(_ name: String, to: UInt64, e: Int, r: Int, c: Int) throws {
                 enc.setComputePipelineState(pT)
@@ -477,9 +622,9 @@ public final class Engine: @unchecked Sendable {
             try words(p + "experts_proj.weight", to: m.pw, e: 96, r: 2048, c: 512)
             try groups(p + "experts_proj.scales", to: m.ps, e: 96, r: 2048, g: 8)
             try groups(p + "experts_proj.biases", to: m.pb, e: 96, r: 2048, g: 8)
-            try words(p + "shared_proj.weight", to: m.spw, e: 1, r: 2048, c: 1024)
-            try groups(p + "shared_proj.scales", to: m.sps, e: 1, r: 2048, g: 16)
-            try groups(p + "shared_proj.biases", to: m.spb, e: 1, r: 2048, g: 16)
+            try words(p + "shared_proj.weight", to: m.spw, e: 1, r: 2048, c: sw)
+            try groups(p + "shared_proj.scales", to: m.sps, e: 1, r: 2048, g: sw / 64)
+            try groups(p + "shared_proj.biases", to: m.spb, e: 1, r: 2048, g: sw / 64)
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
@@ -598,6 +743,11 @@ public final class Engine: @unchecked Sendable {
         enc.setBuffer(hs, offset: 0, index: 3)
         var col = m.col
         enc.setBytes(&col, length: 4, index: 4)
+        if arch.loop != nil {
+            enc.setBuffer(offs, offset: 0, index: 5)
+            enc.setBuffer(loopSums, offset: 0, index: 6)
+            enc.setBuffer(alpha, offset: 0, index: 7)
+        }
         dispatch(enc, "mix", MTLSize(width: 1, height: 1, depth: 1), MTLSize(width: 1024, height: 1, depth: 1))
         debugCopy(enc, m.k)
     }
@@ -612,6 +762,11 @@ public final class Engine: @unchecked Sendable {
         var c = p.col
         enc.setBytes(&c, length: 4, index: 5)
         enc.setBuffer(hs, offset: 0, index: 6)
+        if arch.loop != nil {
+            enc.setBuffer(offs, offset: 0, index: 7)
+            enc.setBuffer(loopSums, offset: 0, index: 8)
+            enc.setBuffer(alpha, offset: 0, index: 9)
+        }
         dispatch(enc, "prep", MTLSize(width: p.count, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
         barrier(enc)
     }
@@ -802,16 +957,16 @@ public final class Engine: @unchecked Sendable {
             dispatch(enc, "router", MTLSize(width: Embla.experts / routerRows, height: 1, depth: 1), MTLSize(width: 32 * routerRows, height: 1, depth: 1))
             debugCopy(enc, 1)
             if Self.sharedBeside && !skip.contains("moe") {   // no barrier: beside the router
-                enc.setComputePipelineState(pShared)
+                enc.setComputePipelineState(L.sharedPipe!)
                 setMoEBuffers(enc, &mw, col: L.mlpCol)
-                dispatch(enc, "moe", MTLSize(width: Embla.sharedDim / 64, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
+                dispatch(enc, "moe", MTLSize(width: L.sharedWidth / 64, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
             }
             barrier(enc)
         }
         if !skip.contains("moe") {
-            enc.setComputePipelineState(pFused)
+            enc.setComputePipelineState(L.fused!)
             setMoEBuffers(enc, &mw, col: L.mlpCol)
-            let slices = Self.sharedBeside ? 8 * Embla.expertDim / 64 : 80
+            let slices = (8 * Embla.expertDim + (Self.sharedBeside ? 0 : L.sharedWidth)) / 64
             dispatch(enc, "moe", MTLSize(width: slices, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
             barrier(enc)
         }
@@ -886,6 +1041,13 @@ public final class Engine: @unchecked Sendable {
         enc = StepEncoder(rest, serial: Self.serial, profiler: profiler)
         encodeEngram(enc, pos: pos)
         for L in layers.dropFirst() {
+            if L.i == arch.loop?.upperBound {
+                // the loop's second pass, then (layer 16's prep) each looped block's b*
+                for T in twins {
+                    encodeAttention(enc, T, pos: pos)
+                    encodeMLP(enc, T)
+                }
+            }
             if prompt && L.i == Embla.prefillLayers {
                 encodeAttention(enc, L, pos: pos, kvOnly: true)
                 enc.endEncoding()

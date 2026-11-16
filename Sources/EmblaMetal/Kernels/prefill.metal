@@ -3,6 +3,12 @@
 // through gemm.metal; these kernels are batched counterparts of the decode ones.
 
 constant constexpr int RING = 4096, HRING = 4096, E = 96, TOPK = 8, F = 512;
+#ifndef SLOTS
+#define SLOTS 9   // source slots a token in state (Embla 1.1's loop: 12)
+#endif
+#ifndef OS
+#define OS 3   // mixes a token in the mix output (Embla 1.1's layer 16 K/V mix: 5)
+#endif
 #ifndef TILE_ENTRIES
 #define TILE_ENTRIES 32   // entries of an expert tile: the GEMM's BM
 #endif
@@ -12,7 +18,7 @@ kernel void embed_b(
     device const uchar*  W     [[buffer(0)]],
     constant ulong3&     off   [[buffer(1)]],
     device const uint*   token [[buffer(2)]],
-    device bfloat*       state [[buffer(3)]],   // [T][9][D]
+    device bfloat*       state [[buffer(3)]],   // [T][SLOTS][D]
     constant int&        p0    [[buffer(4)]],
     uint2 tg  [[threadgroup_position_in_grid]],
     uint t    [[thread_index_in_threadgroup]],
@@ -30,14 +36,14 @@ kernel void embed_b(
         ss += v[n] * v[n];
     }
     const float r = precise::rsqrt(block_sum<256>(ss, buf, lane, sg) / D + EPS);
-    for (int n = 0; n < 8; n++) state[size_t(tg.y) * 9 * D + t * 8 + n] = bfloat(v[n] * r);
+    for (int n = 0; n < 8; n++) state[size_t(tg.y) * SLOTS * D + t * 8 + n] = bfloat(v[n] * r);
 }
 
 // Engram, first half: the gate and g·W_v e (to gated) and its RMS norm (to the history ring at the
 // token's position). Grid (1, T), 1024 threads.
 kernel void engram_gate_b(
     device const bfloat* kv    [[buffer(0)]],   // [T][2][D]: W_k e, W_v e
-    device const bfloat* he    [[buffer(1)]],   // [T][3][D]: the engram mix (not normed)
+    device const bfloat* he    [[buffer(1)]],   // [T][OS][D]: the engram mix (not normed)
     device bfloat*       gated [[buffer(2)]],   // [T][D]
     device bfloat*       hist  [[buffer(3)]],   // [HRING][D]
     constant int&        p0    [[buffer(4)]],
@@ -50,7 +56,7 @@ kernel void engram_gate_b(
     threadgroup float buf[32];
     const int tok = int(tg.y), pos = p0 + tok;
     kv += size_t(tok) * 2 * D;
-    he += size_t(tok) * 3 * D;
+    he += size_t(tok) * OS * D;
     float key[E2], val[E2], kk = 0.0f, xx = 0.0f, kx = 0.0f;
     for (int e = 0; e < E2; e++) {
         const int d = int(t) + e * TG;
@@ -85,7 +91,7 @@ kernel void engram_conv_b(
     device const bfloat* gated [[buffer(0)]],
     device const bfloat* hist  [[buffer(1)]],
     device const bfloat* convw [[buffer(2)]],   // [D, 4]
-    device bfloat*       state [[buffer(3)]],   // [T][9][D]
+    device bfloat*       state [[buffer(3)]],   // [T][SLOTS][D]
     constant int&        p0    [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -97,7 +103,7 @@ kernel void engram_conv_b(
         conv = conv + v * float(convw[d * 4 + i]);
     }
     const float silu = bf(conv / (1.0f + precise::exp(-conv)));
-    state[size_t(tok) * 9 * D + D + d] = bfloat(float(gated[size_t(tok) * D + d]) + silu);
+    state[size_t(tok) * SLOTS * D + D + d] = bfloat(float(gated[size_t(tok) * D + d]) + silu);
 }
 
 // The sliding layers' new keys (normed with the k gains, rotated) and values into the ring. Grid
@@ -266,8 +272,8 @@ kernel void attn_full_b(
     }
 #endif
     device float* pp = part + ((size_t(tok) * p.C + c) * 16 + h) * (HD + 1);
-    for (int i = 0; i < 4; i++) pp[lane + 32 * i] = acc[i];
-    if (lane == 0) pp[HD] = psum;
+    for (int i = 0; i < 4; i++) store_shared(pp + (lane + 32 * i), acc[i]);
+    if (lane == 0) store_shared(pp + (HD), psum);
 
     threadgroup bool last;
     if (!arrive_last(counter + tok * 2 + kvh, uint(p.C), t, &last)) return;
@@ -275,8 +281,8 @@ kernel void attn_full_b(
     float den = sqrt(float(HD)), num[4] = {0, 0, 0, 0};
     for (int cc = 0; cc < p.C; cc++) {
         device const float* q2 = part + ((size_t(tok) * p.C + cc) * 16 + hh) * (HD + 1);
-        den += q2[HD];
-        for (int n = 0; n < 4; n++) num[n] += q2[d0 + n];
+        den += load_shared(q2 + (HD));
+        for (int n = 0; n < 4; n++) num[n] += load_shared(q2 + (d0 + n));
     }
     for (int n = 0; n < 4; n++) o[size_t(tok) * D + hh * HD + d0 + n] = bfloat(num[n] / den);
 }
@@ -284,7 +290,7 @@ kernel void attn_full_b(
 // Router logits of each token (bf16 weights, f32 sums). Grid (12, T), 256 threads.
 kernel void router_b(
     device const bfloat* w      [[buffer(0)]],   // [E][D]
-    device const bfloat* x      [[buffer(1)]],   // [T][3][D]: the MLP input mix
+    device const bfloat* x      [[buffer(1)]],   // [T][OS][D]: the MLP input mix
     device float*        logits [[buffer(2)]],   // [T][E]
     uint2 tg  [[threadgroup_position_in_grid]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -292,7 +298,7 @@ kernel void router_b(
 {
     const int row = int(tg.x) * 8 + int(sg), tok = int(tg.y);
     device const bfloat4* wp = (device const bfloat4*)(w + row * D);
-    device const bfloat4* xp = (device const bfloat4*)(x + size_t(tok) * 3 * D);
+    device const bfloat4* xp = (device const bfloat4*)(x + size_t(tok) * OS * D);
     float acc = 0.0f;
     for (int i = 0; i < 16; i++) acc += dot(float4(wp[i * 32 + lane]), float4(xp[i * 32 + lane]));
     acc = simd_sum(acc);

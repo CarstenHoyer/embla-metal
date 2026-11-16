@@ -79,11 +79,13 @@ public enum EmblaError: Error, CustomStringConvertible {
     case noMetal
     case badFile(String)
     case missingTensor(String)
+    case unsupported(String)
 
     public var description: String {
         switch self {
         case .noMetal: return "no Metal device"
         case .badFile(let s): return "bad file: \(s)"
+        case .unsupported(let s): return "config.json asks for what this engine does not run: \(s)"
         case .missingTensor(let s): return "missing tensor: \(s)"
         }
     }

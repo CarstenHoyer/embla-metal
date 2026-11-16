@@ -83,6 +83,29 @@ inline void write_row8(device char* base, size_t row, int maxS, thread const flo
     if (lane == 0) ((device float*)(base + 2 * size_t(maxS) * HD))[row] = a / 127.0f;
 }
 
+/// A float another threadgroup of the same dispatch reads after `arrive_last` (partial sums, router
+/// logits). With XTG_ATOMIC (GPUs before Apple9: the M1's, whose device-scope fences do not make a
+/// threadgroup's plain stores visible to another, so the last threadgroup read stale values and
+/// decoding was not deterministic) stored and loaded as relaxed atomics, through the coherence point;
+/// plain on the M3 / A17 and later.
+#ifndef XTG_ATOMIC
+#define XTG_ATOMIC 0
+#endif
+inline void store_shared(device float* p, float v) {
+#if XTG_ATOMIC
+    atomic_store_explicit((device atomic_float*)p, v, memory_order_relaxed);
+#else
+    *p = v;
+#endif
+}
+inline float load_shared(device const float* p) {
+#if XTG_ATOMIC
+    return atomic_load_explicit((device atomic_float*)p, memory_order_relaxed);
+#else
+    return *p;
+#endif
+}
+
 /// Last threadgroup of a dispatch: true in every thread of the threadgroup that arrives last at
 /// `counter` (which it resets), after this threadgroup's device writes are made visible.
 inline bool arrive_last(device atomic_uint* counter, uint total, uint t, threadgroup bool* flag) {
@@ -155,8 +178,8 @@ struct GemvRows {
 /// of `prep` and, when MERGE, the partial sum x: m = M0 + w (x - M0), w = σ(q·rms(x) - lse), with
 /// |m|² expanded from |M0|², M0·x and |x|². Computed by a whole threadgroup of TGS threads into
 /// `out [K][D]` (bf16, threadgroup); threadgroup 0 also writes them to `mixout` when given.
-/// `red` holds (TGS / 32) * (2K + 1) + 2K floats.
-template <int NQ, bool MERGE, int TGS>
+/// `red` holds (TGS / 32) * (2K + 1) + 2K floats. Only the first NW mixes go to `mixout`.
+template <int NQ, bool MERGE, int TGS, int NW = NQ>
 inline void mix_input(
     device const float* queries, device const bfloat* m0, device const float4* stats, int col,
     device const float* x, threadgroup bfloat* out, device bfloat* mixout, bool write,
@@ -209,7 +232,7 @@ inline void mix_input(
             if (MERGE) m += w[j] * (xv[e] - m);
             const bfloat r = bfloat(m * scale[j]);
             out[j * D + d] = r;
-            if (write) mixout[j * D + d] = r;
+            if (write && j < NW) mixout[j * D + d] = r;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
