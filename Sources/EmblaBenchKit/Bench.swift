@@ -134,6 +134,8 @@ public func runBench(_ args: [String]) throws {
         try runChain([])
     } else if args.count > 2, args[1] == "e2e" {
         try runE2E(Array(args[2...]))
+    } else if args.count > 2, args[1] == "cache" {
+        try runCache(Array(args[2...]))
     } else if args.count > 4, args[1] == "check" {
         try runCheck(Array(args[2...]))
     } else if args.count > 2, args[1] == "weights" {

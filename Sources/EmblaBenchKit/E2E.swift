@@ -12,6 +12,7 @@ func runE2E(_ args: [String]) throws {
     let reps = args.count > 3 ? Int(args[3])! : 5
     let t0 = Date()
     let engine = try Engine(modelDirectory: URL(fileURLWithPath: args[0]), maxContext: max(4096, p + decode + 64))
+    engine.prefixCaching = false   // every run computes the whole prompt
     print(String(format: "engine ready in %.2f s", Date().timeIntervalSince(t0)))
     var prompt: [Int] = []
     if let file = ProcessInfo.processInfo.environment["EMBLA_PROMPT_FILE"] {

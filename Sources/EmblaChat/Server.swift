@@ -124,11 +124,12 @@ public final class Server: @unchecked Sendable {
                 return c.isOpen
             }
             let usage: [String: Any] = ["prompt_tokens": out.promptTokens, "completion_tokens": out.completionTokens,
-                                        "total_tokens": out.promptTokens + out.completionTokens]
-            let timings: [String: Any] = ["prompt_n": out.promptTokens, "prompt_ms": out.promptMs,
-                                          "predicted_n": out.completionTokens, "predicted_ms": out.decodeMs]
-            log(String(format: "%@ %d prompt tokens (%.0f ms), %d new (%.1f tok/s), %@%@", chat ? "chat" : "completion",
-                       out.promptTokens, out.promptMs, out.completionTokens,
+                                        "total_tokens": out.promptTokens + out.completionTokens,
+                                        "prompt_tokens_details": ["cached_tokens": out.cachedTokens]]
+            let timings: [String: Any] = ["prompt_n": out.promptTokens - out.cachedTokens, "cache_n": out.cachedTokens,
+                                          "prompt_ms": out.promptMs, "predicted_n": out.completionTokens, "predicted_ms": out.decodeMs]
+            log(String(format: "%@ %d prompt tokens, %d from the cache (%.0f ms), %d new (%.1f tok/s), %@%@", chat ? "chat" : "completion",
+                       out.promptTokens, out.cachedTokens, out.promptMs, out.completionTokens,
                        Double(max(0, out.completionTokens - 1)) / max(1e-9, out.decodeMs / 1e3), out.finishReason,
                        c.isOpen ? "" : " (client left)"))
             if stream {

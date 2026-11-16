@@ -45,6 +45,8 @@ public final class ChatModel: @unchecked Sendable {
     public struct Outcome {
         public var finishReason: String
         public var promptTokens: Int, completionTokens: Int
+        /// Prompt tokens taken from the engine's prefix cache (an earlier request's) instead of computed.
+        public var cachedTokens: Int
         public var promptMs: Double, decodeMs: Double
     }
 
@@ -111,6 +113,6 @@ public final class ChatModel: @unchecked Sendable {
         if alive && finish != "stop" || !content.isEmpty { _ = emitContent(final: true) }
         let promptMs = (firstAt ?? Date()).timeIntervalSince(t0) * 1e3
         return Outcome(finishReason: finish, promptTokens: r.prompt.count, completionTokens: made,
-                       promptMs: promptMs, decodeMs: Date().timeIntervalSince(firstAt ?? Date()) * 1e3)
+                       cachedTokens: engine.reusedTokens, promptMs: promptMs, decodeMs: Date().timeIntervalSince(firstAt ?? Date()) * 1e3)
     }
 }

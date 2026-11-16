@@ -40,6 +40,7 @@ func runGen(_ args: [String]) throws {
     let tokens = try String(contentsOfFile: args[1], encoding: .utf8).split(whereSeparator: \.isWhitespace).map { Int($0)! }
     let p = Int(args[2])!, n = Int(args[3])!
     let engine = try Engine(modelDirectory: URL(fileURLWithPath: args[0]), maxContext: max(4096, p + n + 64))
+    engine.prefixCaching = false   // EMBLA_TWICE below times the whole prompt again
     let r = engine.generate(prompt: Array(tokens[..<p]), count: n)
     print(String(format: "prompt %d tokens in %.0f ms (%.0f tok/s; batched part: GPU %.0f ms, engram reads %.0f ms), then %.0f tok/s",
                  p, engine.prefillSeconds * 1e3, Double(p) / engine.prefillSeconds, engine.prefillGPU * 1e3, engine.prefillRead * 1e3, 1 / r.wallPerToken))

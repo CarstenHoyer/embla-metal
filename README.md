@@ -19,7 +19,8 @@ swift run -c release embla serve --open    # a local server, and the chat page i
 The first `swift run` builds for a minute or so. `serve` listens only on this Mac at
 `http://127.0.0.1:8080`: a chat page at `/` and an OpenAI-compatible API at `/v1`
 (`chat/completions`, `completions`, `models`; streamed or not). OpenAI clients can use
-`base_url="http://127.0.0.1:8080/v1"`; an API key is not required. Options: `--port`, `--host`,
+`base_url="http://127.0.0.1:8080/v1"`; an API key is not required. A conversation's earlier turns
+come from the prefix cache, reported as `usage.prompt_tokens_details.cached_tokens`. Options: `--port`, `--host`,
 `--context` (the longest conversation in tokens, default 32768) and `--model` (another repo in
 the cache, or a directory).
 
@@ -61,6 +62,11 @@ Prompts on the iPhone run at 4.7-5.1k tokens a second. Sampling costs ~2% agains
   past 1152 tokens the sparse layers attend the 1024 highest-scoring keys and the 128 latest.
 - **Sampling:** temperature and top-p in the step's last kernel (Gumbel-max over the nucleus), so
   decoding stays pipelined.
+- **Prefix cache:** the engine keeps the last sequence's keys and values. A prompt that starts the
+  same way, such as a conversation's next turn, computes only what is new; the tokens are the same
+  as computing it all (`embla-bench cache`). Nothing to call: `generate` finds the shared prefix
+  itself. On the M5 Pro the next turn of a 5k-token conversation starts in 23 ms instead of 427.
+  `EMBLA_PREFIX_CACHE=0` turns it off.
 - **Checked** against a reference implementation's logits step by step (`embla-bench check`).
 
 ## On an iPhone
@@ -80,6 +86,7 @@ M=$(ls -d ~/.cache/huggingface/hub/models--sevren-ai--Embla1-4bit/snapshots/*/)
 .build/release/embla-bench speed $M 256          # decode tok/s
 .build/release/embla-bench det $M 64             # the same tokens twice: any logit that differs
 .build/release/embla-bench check $M tokens.txt out/   # every step's logits
+.build/release/embla-bench cache $M 1024 64      # prefix cache hits against computing from scratch
 ```
 
 Swift 6 (Xcode 16 or later). The libraries: `EmblaMetal` (the engine), `EmblaChat` (tokenizer,
