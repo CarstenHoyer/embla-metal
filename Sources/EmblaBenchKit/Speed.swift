@@ -23,6 +23,7 @@ func runSpeed(_ args: [String]) throws {
     print(String(format: "prompt of %d tokens: %.0f ms (%.0f tok/s)", prompt.count, engine.prefillSeconds * 1e3, Double(prompt.count) / engine.prefillSeconds))
     print(String(format: "context %d: wall %.3f ms/token (%.0f tok/s), GPU %.3f ms/step (%.0f tok/s)",
                  prompt.count, base.wallPerToken * 1e3, 1 / base.wallPerToken, base.gpuPerStep * 1e3, 1 / base.gpuPerStep))
+    print("  dispatches a decode step: \(engine.stepDispatches)")
     print(String(format: "  GPU: first buffer %.0f µs, gap %.0f µs, second buffer %.0f µs, gap to next step %.0f µs", engine.gaps.0, engine.gaps.1, engine.gaps.2, engine.gaps.3))
     print(String(format: "  round trip: GPU done -> CPU awake %.0f µs, engram read + signal %.0f µs, signal -> GPU resumes %.0f µs", engine.latency.0, engine.latency.1, engine.latency.2))
     print(String(format: "  CPU per token: engram read %.0f µs, waiting for the step %.0f µs",

@@ -12,6 +12,8 @@ final class StepEncoder {
     /// The part the next dispatches belong to (set by the engine before it dispatches).
     var label = "other"
     private var labels: [String] = []
+    /// Dispatches encoded (the step's count).
+    private(set) var dispatches = 0
 
     init(_ cb: MTLCommandBuffer, serial: Bool, profiler: Profiler?) {
         self.cb = cb
@@ -37,10 +39,12 @@ final class StepEncoder {
     func setBytes(_ p: UnsafeRawPointer, length: Int, index: Int) { e.setBytes(p, length: length, index: index) }
     func dispatchThreadgroups(_ g: MTLSize, threadsPerThreadgroup t: MTLSize) {
         labels.append(label)
+        dispatches += 1
         e.dispatchThreadgroups(g, threadsPerThreadgroup: t)
     }
     func dispatchThreads(_ g: MTLSize, threadsPerThreadgroup t: MTLSize) {
         labels.append(label)
+        dispatches += 1
         e.dispatchThreads(g, threadsPerThreadgroup: t)
     }
 

@@ -1,10 +1,30 @@
 # Embla 1.1 in embla-metal: design
 
-Status: design, 2026-11-16. Nothing implemented yet. The model is heimr-edge's Embla 1.1 (sevren-ai/sparsify
-`agent_plans/EMBLA_1_1.md`; the PyTorch truth is branch `kweind/embla-1.1-model` 47db72d, `_run_loop`). A reference
-port exists in the MLX app harness (sevren-ai/heimr-ios `engind/embla-1.1-runtime` 01c0d43). It checks against the
-trainer and is a map of what changes, not code to copy. Every change here is driven by `config.json`, and Embla 1
-must stay bit-identical at the same speed (its pipelines keep their macros; 1.1 adds new instantiations).
+Status: implemented, decode and prefill (branch `engind/embla-1.1`, 2026-11-16). The model is heimr-edge's Embla 1.1
+(sevren-ai/sparsify `agent_plans/EMBLA_1_1.md`; the PyTorch truth is branch `kweind/embla-1.1-model`, re-read at
+bdb8333, `_run_loop`). A reference port exists in the MLX app harness (sevren-ai/heimr-ios `engind/embla-1.1-runtime`
+01c0d43). It checks against the trainer and is a map of what changes, not code to copy. Every change here is driven by
+`config.json` (`Arch`), and Embla 1 must stay bit-identical at the same speed (its pipelines keep their macros; 1.1
+adds new instantiations).
+
+## As implemented
+
+- `Arch` (Arch.swift) reads kv_sources, kv_mix_layers, moe_router_mix(_layers), mlp_layer_types,
+  shared_expert_layer_sizes and loop_layers; anything else the kernels do not take is refused at load.
+- b* has no kernel of its own: layer 16's prep (decode) and attention mix (prefill) compute it (`STAR`), as APPEND
+  computes a completed block, and write it to slots 6 and 7. The fp32 sums: `KEEP` rows 0 (B2, pass 1), 1 (B3, pass 1,
+  at pass 2's start), 2 (B2', pass 2); B3' is x itself.
+- `OFFS` is needed only in prep and mix: the fused-mix GEMVs, the router and the reduce take prep's lse.
+- mix `LOWREG`: the final mix over 11 sources (and prefill's layer 16 mix, 8 sources x 5 queries) needs more
+  registers than 1024 threads have (832 and 576 on the M1); the same sums, reduced per source, with fewer.
+- Dispatches a decode step (measured): Embla 1 209, Embla 1.1 260 (+51: pass 2's 8 layers, layer 0's MoE).
+- Not in the design: on GPUs before Apple9 (M1, M2) the cross-threadgroup reads after `arrive_last` (router logits,
+  reduce sums, attention partials) were stale, so Embla 1 itself decoded non-deterministically there. They go through
+  atomics on those GPUs (`XTG_ATOMIC`, common.metal); Apple9 and later compile as before.
+- `scripts/embla11_synth.py` makes a synthetic 1.1 from Embla1-4bit (`--preserve`: the function-preserving form).
+  The preserve form matches Embla 1 up to rounding, not bit for bit: layer 0's shared expert sums its down
+  projection as the MoE does, and each looped block's softmax weight is split between b and b* by the -log 2 offsets.
+- `Apps/EmblaBench`: the smallest iPhone host for `embla-bench` (xcodegen).
 
 ## What Embla 1.1 changes, against this engine's plans (`Engine.buildPlans`)
 

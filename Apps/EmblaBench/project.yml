@@ -1,0 +1,34 @@
+# The smallest iPhone host for EmblaBenchKit: `xcodegen generate`, then build with your team and bundle id, e.g.
+#   xcodebuild -project EmblaBench.xcodeproj -scheme EmblaBench -destination generic/platform=iOS \
+#     DEVELOPMENT_TEAM=<team> PRODUCT_BUNDLE_IDENTIFIER=<id> -allowProvisioningUpdates build
+name: EmblaBench
+options:
+  deploymentTarget:
+    iOS: "18.0"
+packages:
+  embla-metal:
+    path: ../..
+targets:
+  EmblaBench:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    dependencies:
+      - package: embla-metal
+        product: EmblaBenchKit
+    info:
+      path: Sources/Info.plist
+      properties:
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UILaunchScreen: {}
+        CFBundleDisplayName: EmblaBench
+    entitlements:
+      path: Sources/EmblaBench.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1"

@@ -1036,6 +1036,8 @@ public final class Engine: @unchecked Sendable {
 
         enc.endEncoding()
         endChained(first)
+        let firstDispatches = enc.dispatches
+        defer { if !prompt { stepDispatches = firstDispatches + enc.dispatches } }
         let rest = chainedCommandBuffer()
         rest.encodeWaitForEvent(engramReady, value: engramBase + UInt64(pos + 1))
         enc = StepEncoder(rest, serial: Self.serial, profiler: profiler)
@@ -1091,6 +1093,8 @@ public final class Engine: @unchecked Sendable {
 
     /// CPU seconds spent reading engram rows, and waiting for steps, in `generate` (profiling).
     public private(set) var engramSeconds = 0.0, waitSeconds = 0.0
+    /// Dispatches in the last decode step encoded (both command buffers).
+    public private(set) var stepDispatches = 0
     /// Seconds from the start of `generate` to the first new token (the prompt).
     public private(set) var prefillSeconds = 0.0
     /// Prefill in batches (the prompt's matrices as GEMMs); EMBLA_BATCH=0 runs the prompt as decode steps.
