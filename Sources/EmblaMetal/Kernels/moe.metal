@@ -40,7 +40,7 @@ kernel void moe_router(
     device const float4* stats   [[buffer(4)]],
     device const float*  xres    [[buffer(5)]],
     device bfloat*       hm      [[buffer(6)]],
-    device float*        logits  [[buffer(7)]],
+    device coherent(device) float* logits [[buffer(7)]],
     device atomic_uint*  counter [[buffer(8)]],
     device uint*         route   [[buffer(9)]],   // [TOPK] experts, then [TOPK] gates (f32 bits)
     constant int&        col     [[buffer(10)]],
@@ -235,13 +235,13 @@ kernel void moe_fused(
 #endif
 kernel void moe_reduce(
     device const float*  part    [[buffer(0)]],
-    device float*        x       [[buffer(1)]],
+    device coherent(device) float* x [[buffer(1)]],
     device const float*  queries [[buffer(2)]],
     device const bfloat* m0      [[buffer(3)]],
     device const float4* stats   [[buffer(4)]],
     constant int&        col     [[buffer(5)]],
     device atomic_uint*  counter [[buffer(6)]],
-    device float*        dots    [[buffer(7)]],   // [threadgroups][2 MIXK + 1]
+    device coherent(device) float* dots [[buffer(7)]],   // [threadgroups][2 MIXK + 1]
     device bfloat*       hs      [[buffer(8)]],
     uint tg   [[threadgroup_position_in_grid]],
     uint t    [[thread_index_in_threadgroup]],
